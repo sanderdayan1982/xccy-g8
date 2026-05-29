@@ -1,101 +1,160 @@
 """
 fetch_saron.py
 ==============
-Scraper for Swiss Average Rate Overnight (SARON) from Swiss National Bank.
+Scraper for SARON (Swiss Average Rate Overnight) and SARON Compound Rates
+(1M/3M/6M) from Swiss National Bank.
 
-Source:   SNB data service (data.snb.ch)
-Endpoint: https://data.snb.ch/api/cube/zimoma/data/json
-Cube:     zimoma (Money market rates)
-Filter:   D0 dimension = SARON (Swiss Average Rate Overnight)
-Format:   JSON
+Source:   SNB Data Portal — cube `zirepo`
+Endpoint: https://data.snb.ch/api/cube/zirepo/data/csv/en
+Updated:  Daily (verified empirically 2026-05-29, PublishingDate 2026-05-21)
+
+Why cube `zirepo` (not `zimoma`):
+    The previous version of this scraper used cube `zimoma` (Money market rates),
+    but that cube is published at END-OF-MONTH frequency, not daily. The cube
+    `zirepo` is the SNB's daily SARON publication, with 9 series including the
+    overnight SARON and the backward-looking Compound Rates introduced in 2017.
+
+Series extracted (CSV dimension D0):
+    H0  — Overnight (SARON), close of trading       → SARON.csv          (RFR for engine)
+    H6  — SARON 1M Compound Rate                    → SARON_1M_COMPOUND.csv
+    H7  — SARON 3M Compound Rate                    → SARON_3M_COMPOUND.csv
+    H8  — SARON 6M Compound Rate                    → SARON_6M_COMPOUND.csv
+
+Why Compound Rates also (not just overnight):
+    The SARON Compound Rates are the CHF equivalent of SOFR 30/90/180-day
+    Average (NY Fed), SONIA Compounded Index (BoE), €STR Compounded Average
+    (ECB). They are the backward-looking compounded version of the overnight
+    RFR, and are exactly the rates used by institutional XCCY basis swap
+    quotes (Bloomberg/Refinitiv). Having them lets the engine compute the
+    "clean" CIP basis using symmetric tenor RFR pairs (e.g. SARON_3M_Compound
+    vs SOFR_90DAY_AVG), in addition to the sovereign-bills based proxy.
+
+Format details:
+    - CSV with `;` separator (NOT comma)
+    - Values quoted with `"`
+    - Preamble: CubeId line, PublishingDate line, blank line, then header
+    - Header: "Date";"D0";"Value"
+    - Long format: one row per (date, dimension) tuple
+    - Values in PERCENT (e.g. -0.041183 = -0.041183%), consistent with other
+      scrapers — NOT divided
 
 Output:
-    data/SARON.csv  — SARON historical series in OHLCV format
+    data/SARON.csv              — overnight SARON (used by engine as RFR_CHF)
+    data/SARON_1M_COMPOUND.csv  — 1M compound (for Compound-Rates basis arch)
+    data/SARON_3M_COMPOUND.csv  — 3M compound (primary symmetric tenor)
+    data/SARON_6M_COMPOUND.csv  — 6M compound
 
-License: Data sourced from Swiss National Bank public statistics.
-         SNB retains all rights to source data.
+License: SNB Data Portal public statistics. Used with attribution per SNB
+         terms.
 """
 
 import csv
 import sys
 from datetime import datetime, timedelta
+from io import StringIO
 from pathlib import Path
 
 import requests
 
 
 # Constants
-SNB_URL = "https://data.snb.ch/api/cube/zimoma/data/json/en"
-DIMENSION_FILTER = "SARON"
-OUTPUT_PATH = Path(__file__).resolve().parent.parent / "data" / "SARON.csv"
+SNB_URL = "https://data.snb.ch/api/cube/zirepo/data/csv/en"
 HISTORY_YEARS = 5
-TIMEOUT_SECONDS = 30
+TIMEOUT_SECONDS = 45
 USER_AGENT = "xccy-g8/1.0 (https://github.com/sanderdayan1982/xccy-g8)"
 
+# Dimension ID in the cube -> output filename
+SERIES = {
+    "H0": "SARON.csv",              # Overnight SARON (engine RFR_CHF)
+    "H6": "SARON_1M_COMPOUND.csv",  # 1M Compound
+    "H7": "SARON_3M_COMPOUND.csv",  # 3M Compound (primary symmetric tenor)
+    "H8": "SARON_6M_COMPOUND.csv",  # 6M Compound
+}
 
-def fetch_saron_data(date_from: datetime, date_to: datetime) -> list[tuple[str, float]]:
+OUTPUT_DIR = Path(__file__).resolve().parent.parent / "data"
+
+# Marker that precedes the data header row
+HEADER_MARKER_PREFIX = '"Date"'
+
+
+def fetch_saron(
+    date_from: datetime,
+    date_to: datetime,
+) -> dict[str, list[tuple[str, float]]]:
     """
-    Fetch SARON daily data from SNB.
+    Fetch SARON + Compound Rates from SNB cube `zirepo` in a single request.
 
-    SNB JSON structure:
-        {
-          "timeseries": [
-            {
-              "dimensionItem": ["SARON", ...],
-              "values": [
-                {"date": "YYYY-MM-DD", "value": X.XXXX},
-                ...
-              ]
-            },
-            ...
-          ]
-        }
-
-    Returns list of (date_str_YYYYMMDD, rate_value) tuples sorted ascending.
+    Returns dict mapping dimension ID (H0/H6/H7/H8) to sorted list of
+    (date_str_YYYYMMDD, value_percent) tuples.
     """
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json",
+    params = {
+        "fromDate": date_from.strftime("%Y-%m-%d"),
+        "toDate": date_to.strftime("%Y-%m-%d"),
     }
+    headers = {"User-Agent": USER_AGENT, "Accept": "text/csv"}
 
-    response = requests.get(SNB_URL, headers=headers, timeout=TIMEOUT_SECONDS)
+    response = requests.get(SNB_URL, params=params, headers=headers, timeout=TIMEOUT_SECONDS)
     response.raise_for_status()
 
-    data = response.json()
-    if "timeseries" not in data:
-        raise ValueError("SNB response missing 'timeseries' key")
+    text = response.text
+    if not text or "CubeId" not in text[:50]:
+        raise ValueError(
+            "SNB response empty or unexpected header. Cube `zirepo` may have changed."
+        )
 
-    saron_series = None
-    for series in data["timeseries"]:
-        dims = series.get("dimensionItem", [])
-        if dims and dims[0] == DIMENSION_FILTER:
-            saron_series = series
+    lines = text.splitlines()
+
+    # Locate the data header row (starts with "Date")
+    data_start = None
+    for i, line in enumerate(lines):
+        if line.startswith(HEADER_MARKER_PREFIX):
+            data_start = i
             break
 
-    if saron_series is None:
-        raise ValueError(f"SNB response has no series matching dimension '{DIMENSION_FILTER}'")
+    if data_start is None:
+        raise ValueError(
+            f"SNB CSV: header row starting with {HEADER_MARKER_PREFIX!r} not found"
+        )
 
-    rows: list[tuple[str, float]] = []
-    for obs in saron_series.get("values", []):
-        date_raw = obs.get("date")
-        value_raw = obs.get("value")
+    # Parse with semicolon delimiter (SNB convention) and quote chars
+    reader = csv.reader(lines[data_start:], delimiter=";", quotechar='"')
+    header = next(reader)
 
-        if date_raw is None or value_raw is None:
+    if len(header) < 3 or header[0] != "Date":
+        raise ValueError(
+            f"SNB CSV: expected header ['Date', 'D0', 'Value'], got: {header}"
+        )
+
+    # Group rows by dimension ID
+    results: dict[str, list[tuple[str, float]]] = {sid: [] for sid in SERIES}
+
+    for row in reader:
+        if len(row) < 3:
+            continue
+        date_str, dim_id, value_str = row[0].strip(), row[1].strip(), row[2].strip()
+
+        if dim_id not in SERIES:
+            continue
+        if not date_str or not value_str:
             continue
 
         try:
-            date_obj = datetime.strptime(date_raw, "%Y-%m-%d")
-            value = float(value_raw)
-        except (ValueError, TypeError):
+            date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
             continue
 
-        if date_obj < date_from or date_obj > date_to:
+        try:
+            value = float(value_str)
+        except ValueError:
             continue
 
-        rows.append((date_obj.strftime("%Y%m%d"), value))
+        # Store in YYYYMMDD format (consistent with all other scrapers)
+        results[dim_id].append((date_obj.strftime("%Y%m%d"), value))
 
-    rows.sort(key=lambda r: r[0])
-    return rows
+    for dim_id in results:
+        results[dim_id].sort(key=lambda r: r[0])
+
+    return results
 
 
 def write_csv(rows: list[tuple[str, float]], output_path: Path) -> None:
@@ -114,10 +173,12 @@ def main() -> int:
     date_from = today - timedelta(days=365 * HISTORY_YEARS)
 
     print(f"Fetching SARON from {date_from.date()} to {today.date()}")
-    print(f"SNB cube: zimoma, dimension: {DIMENSION_FILTER}")
+    print(f"SNB cube: zirepo (daily)")
+    print(f"Series: {list(SERIES.keys())} (H0=Overnight, H6/H7/H8=Compound 1M/3M/6M)")
+    print()
 
     try:
-        rows = fetch_saron_data(date_from, today)
+        results = fetch_saron(date_from, today)
     except requests.HTTPError as exc:
         print(f"ERROR: SNB HTTP error: {exc}", file=sys.stderr)
         return 1
@@ -128,15 +189,27 @@ def main() -> int:
         print(f"ERROR: SARON fetch failed: {exc}", file=sys.stderr)
         return 1
 
-    if not rows:
-        print("ERROR: No SARON rows returned from SNB", file=sys.stderr)
-        return 1
+    successes = 0
+    failures = 0
 
-    write_csv(rows, OUTPUT_PATH)
-    print(f"OK: Wrote {len(rows)} rows to {OUTPUT_PATH}")
-    print(f"     Latest: {rows[-1][0]} = {rows[-1][1]:.4f}%")
-    print(f"     Earliest: {rows[0][0]} = {rows[0][1]:.4f}%")
-    return 0
+    for dim_id, filename in SERIES.items():
+        rows = results.get(dim_id, [])
+        output_path = OUTPUT_DIR / filename
+
+        if not rows:
+            print(f"[{dim_id}] ERROR: No rows for {filename}", file=sys.stderr)
+            failures += 1
+            continue
+
+        write_csv(rows, output_path)
+        print(f"[{dim_id}] OK: Wrote {len(rows)} rows to {filename}")
+        print(f"        Latest:   {rows[-1][0]} = {rows[-1][1]:.4f}%")
+        print(f"        Earliest: {rows[0][0]} = {rows[0][1]:.4f}%")
+        print()
+        successes += 1
+
+    print(f"Summary: {successes} OK, {failures} failed (of {len(SERIES)} total)")
+    return 0 if failures == 0 else 1
 
 
 if __name__ == "__main__":
