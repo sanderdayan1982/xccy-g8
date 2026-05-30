@@ -74,7 +74,7 @@ jobs:
         id: corra
 
       - name: Fetch NZD OCR via BIS (NZD reference)
-        run: python scripts/fetch_ocr.py
+        run: python scripts/fetch_bis_ocr.py
         continue-on-error: true
         id: ocr
 
