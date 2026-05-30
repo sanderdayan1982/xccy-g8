@@ -102,7 +102,7 @@ TENORS = {
 # Match files inside the ZIP. The BoE prefixes filenames with a timestamp;
 # we match by the stable "GLC_Nominal_daily_data_*.xlsx" suffix.
 XLSX_PATTERN = re.compile(
-    r"GLC_Nominal_daily_data_(\d{4})_to_(\d{4}|present)\.xlsx$",
+    r"GLC[ _]Nominal[ _]daily[ _]data[ _](\d{4})[ _]to[ _](\d{4}|present)\.xlsx$",
     re.IGNORECASE,
 )
 
