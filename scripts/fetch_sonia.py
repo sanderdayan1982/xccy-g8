@@ -3,13 +3,13 @@ fetch_sonia.py
 ==============
 Scraper for Sterling Overnight Index Average (SONIA) from Bank of England.
 
-Source:   Bank of England Interactive Database (IADB)
+Source: Bank of England Interactive Database (IADB)
+Series code: IUDSOIA (Daily Sterling Overnight Index Average)
 Endpoint: https://www.bankofengland.co.uk/boeapps/database/_iadb-fromshowcolumns.asp
-Series:   IUDSOIA (Daily Sterling Overnight Index Average)
-Format:   CSV with DATE, VALUE columns
 
-Output:
-    data/SONIA.csv  — SONIA historical series in OHLCV format
+Output: data/SONIA.csv in Pine Seeds format
+        DATE,OPEN,HIGH,LOW,CLOSE,VOLUME
+        YYYYMMDD,value,value,value,value,0
 
 License: Data sourced from Bank of England public statistics.
          Bank of England retains all rights to source data.
@@ -26,51 +26,35 @@ import requests
 
 # Constants
 SERIES_CODE = "IUDSOIA"
-BOE_URL = "https://www.bankofengland.co.uk/boeapps/database/_iadb-FromShowColumns.asp"
+BOE_URL = "https://www.bankofengland.co.uk/boeapps/database/_iadb-fromshowcolumns.asp"
 OUTPUT_PATH = Path(__file__).resolve().parent.parent / "data" / "SONIA.csv"
 HISTORY_YEARS = 5
 TIMEOUT_SECONDS = 30
-USER_AGENT = "xccy-g8/1.0 (https://github.com/sanderdayan1982/xccy-g8)"
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 
 def build_request_url(date_from: datetime, date_to: datetime) -> str:
-    """Build BoE IADB query URL for SONIA series."""
+    """Build BoE IADB query URL for SONIA series in CSV export mode."""
     params = {
-        "Travel": "NIxAZxSUx",
-        "FromSeries": "1",
-        "ToSeries": "50",
-        "DAT": "RNG",
-        "FD": date_from.strftime("%d"),
-        "FM": date_from.strftime("%b"),
-        "FY": date_from.strftime("%Y"),
-        "TD": date_to.strftime("%d"),
-        "TM": date_to.strftime("%b"),
-        "TY": date_to.strftime("%Y"),
-        "FNY": "Y",
-        "CSVF": "TN",
-        "html.x": "66",
-        "html.y": "26",
+        "csv.x": "yes",
+        "Datefrom": date_from.strftime("%d/%b/%Y"),
+        "Dateto": date_to.strftime("%d/%b/%Y"),
         "SeriesCodes": SERIES_CODE,
+        "CSVF": "TN",
         "UsingCodes": "Y",
-        "Filter": "N",
-        "title": SERIES_CODE,
         "VPD": "Y",
+        "VFD": "N",
     }
     return f"{BOE_URL}?{urlencode(params)}"
 
 
-def fetch_sonia_data(date_from: datetime, date_to: datetime) -> list[tuple[str, float]]:
-    """
-    Fetch SONIA daily data from Bank of England.
-
-    Returns list of (date_str_YYYYMMDD, rate_value) tuples sorted ascending.
-    """
+def fetch_sonia_csv(date_from: datetime, date_to: datetime) -> str:
+    """Fetch SONIA CSV from Bank of England IADB."""
     url = build_request_url(date_from, date_to)
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/csv",
-    }
+    print(f"Fetching SONIA from {date_from.date()} to {date_to.date()}")
+    print(f"BoE IADB series: {SERIES_CODE}")
 
+    headers = {"User-Agent": USER_AGENT}
     response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
     response.raise_for_status()
 
@@ -78,64 +62,79 @@ def fetch_sonia_data(date_from: datetime, date_to: datetime) -> list[tuple[str, 
     if not text or "DATE" not in text.upper():
         raise ValueError("BoE response empty or missing DATE header")
 
-    rows: list[tuple[str, float]] = []
-    reader = csv.reader(text.splitlines())
-    header = next(reader, None)
-    if not header:
-        raise ValueError("BoE response has no rows")
+    return text
 
-    for row in reader:
-        if len(row) < 2:
+
+def parse_boe_csv(csv_text: str) -> list:
+    """Parse BoE CSV response into list of (date, value) tuples."""
+    rows = []
+    lines = csv_text.strip().split("\n")
+
+    # Skip header line "DATE,IUDSOIA"
+    for line in lines[1:]:
+        line = line.strip()
+        if not line:
             continue
+
+        parts = line.split(",")
+        if len(parts) < 2:
+            continue
+
+        date_str = parts[0].strip()
+        value_str = parts[1].strip()
+
+        if not date_str or not value_str:
+            continue
+
         try:
-            date_obj = datetime.strptime(row[0].strip(), "%d %b %Y")
-            value = float(row[1].strip())
-        except (ValueError, IndexError):
+            # BoE format: "02 Jan 2026"
+            date = datetime.strptime(date_str, "%d %b %Y")
+            value = float(value_str)
+            rows.append((date, value))
+        except (ValueError, TypeError) as e:
+            print(f"Warning: skipping malformed row '{line}': {e}")
             continue
-        rows.append((date_obj.strftime("%Y%m%d"), value))
 
-    rows.sort(key=lambda r: r[0])
     return rows
 
 
-def write_csv(rows: list[tuple[str, float]], output_path: Path) -> None:
-    """Write rows to OHLCV format CSV (O=H=L=C for daily rates, V=0)."""
+def write_pine_seeds_csv(rows: list, output_path: Path) -> None:
+    """Write rows to Pine Seeds OHLCV format."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", newline="") as f:
+
+    with open(output_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["DATE", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"])
-        for date_str, value in rows:
-            v = f"{value:.4f}"
-            writer.writerow([date_str, v, v, v, v, "0"])
+
+        for date, value in rows:
+            date_str = date.strftime("%Y%m%d")
+            # SONIA is a single value per day; use it for OHLC, volume = 0
+            writer.writerow([date_str, value, value, value, value, 0])
 
 
 def main() -> int:
-    today = datetime.utcnow()
-    date_from = today - timedelta(days=365 * HISTORY_YEARS)
-
-    print(f"Fetching SONIA from {date_from.date()} to {today.date()}")
-    print(f"BoE IADB series: {SERIES_CODE}")
+    """Fetch SONIA and write to data/SONIA.csv."""
+    date_to = datetime.utcnow()
+    date_from = date_to - timedelta(days=HISTORY_YEARS * 365)
 
     try:
-        rows = fetch_sonia_data(date_from, today)
-    except requests.HTTPError as exc:
-        print(f"ERROR: BoE HTTP error: {exc}", file=sys.stderr)
+        csv_text = fetch_sonia_csv(date_from, date_to)
+    except requests.exceptions.RequestException as e:
+        print(f"ERROR: HTTP request failed: {e}", file=sys.stderr)
         return 1
-    except requests.RequestException as exc:
-        print(f"ERROR: BoE network error: {exc}", file=sys.stderr)
-        return 1
-    except Exception as exc:
-        print(f"ERROR: SONIA fetch failed: {exc}", file=sys.stderr)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
+    rows = parse_boe_csv(csv_text)
     if not rows:
         print("ERROR: No SONIA rows returned from BoE", file=sys.stderr)
         return 1
 
-    write_csv(rows, OUTPUT_PATH)
-    print(f"OK: Wrote {len(rows)} rows to {OUTPUT_PATH}")
-    print(f"     Latest: {rows[-1][0]} = {rows[-1][1]:.4f}%")
-    print(f"     Earliest: {rows[0][0]} = {rows[0][1]:.4f}%")
+    write_pine_seeds_csv(rows, OUTPUT_PATH)
+    print(f"OK: wrote {len(rows)} rows to {OUTPUT_PATH}")
+    print(f"     range: {rows[0][0].date()} -> {rows[-1][0].date()}")
+    print(f"     last value: {rows[-1][1]}")
     return 0
 
 
