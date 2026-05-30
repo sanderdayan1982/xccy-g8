@@ -1,274 +1,199 @@
 """
 fetch_tona.py
 =============
-Scraper for Tokyo Overnight Average Rate (TONA) from Bank of Japan.
+Scraper for TONA (Tokyo Overnight Average rate) from Bank of Japan.
 
-Strategy: Double-layered resilience
-    PRIMARY:  BoJ Time-Series Data Search API (modern REST, launched Feb 18, 2026)
-              https://www.stat-search.boj.or.jp/api/v1/getDataCode
-              Database: FM01 (Uncollateralized Overnight Call Rate, average)
-              Series:   STRDCLUCON
-              Format:   JSON
-              Verified against official BoJ API Manual (api_manual_en.pdf, p.26)
+Source:   Bank of Japan — Time-Series Data Search REST API v1
+Endpoint: https://www.stat-search.boj.or.jp/api/v1/getDataCode
+Updated:  Daily (verified empirically 2026-05-31, LAST_UPDATE: 20260529)
 
-    FALLBACK: BoJ legacy CGI endpoint
-              https://www.stat-search.boj.or.jp/ssi/cgi-bin/famecgi2
-              Series:   IR01'MUTCALAL
-              Format:   CSV (with defensive parsing)
+History of this scraper:
+    The previous version of this scraper used two legacy endpoints:
+        - Primary:  /stat/data/STRDCLUCON.json
+        - Fallback: /ssi/cgi-bin/famecgi2 (CGI legacy)
+    Both endpoints returned HTML error pages ("Page cannot be displayed")
+    after the BoJ migrated to a new REST API. The new API uses a different
+    URL structure and JSON schema.
+
+API parameters:
+    db          = "FM01"           ← Financial Markets 01 database
+    code        = "STRDCLUCON"     ← Call Rate, Uncollateralized Overnight, Average Daily
+    format      = "json"
+    lang        = "en"
+    startDate   = "YYYYMM"          (monthly range, not daily)
+    endDate     = "YYYYMM"
+
+Full series code in BoJ portal: FM01'STRDCLUCON
+    - "FM01" is the database (passed as `db=` parameter)
+    - "STRDCLUCON" is the series code (passed as `code=` parameter)
+    - The apostrophe + db prefix in the portal display is NOT used in the API
+
+Response schema (verified empirically with real JSON):
+    {
+      "STATUS": 200,                       # int, not string
+      "RESULTSET": [
+        {
+          "SERIES_CODE": "STRDCLUCON",
+          "VALUES": {
+            "SURVEY_DATES": [20260401, ...],   # int YYYYMMDD
+            "VALUES": [0.728, null, 0.727, ...] # float or null
+          }
+        }
+      ]
+    }
+
+    - Dates come as integers in YYYYMMDD format (not strings)
+    - Values come as floats in percent (e.g. 0.728 = 0.728%)
+    - null indicates no trading day (weekend, holiday)
+    - Both arrays have same length and index correspondence
 
 Output:
-    data/TONA.csv  — TONA historical series in OHLCV format
+    data/TONA.csv  — daily TONA in OHLCV format
 
-License: Data sourced from Bank of Japan public statistics.
-         BoJ retains all rights to source data.
-
-Notes:
-    The modern API is the preferred source because it was designed by BoJ
-    for programmatic access (won't block datacenter IPs like GitHub Actions).
-    The CGI legacy fallback provides resilience in case the modern API has
-    any issue (e.g. rate limit, transient outage, series code changes).
+License: Bank of Japan public statistics. The BoJ Time-Series Data Search
+         is publicly accessible and supports programmatic access via this
+         documented REST API.
 """
 
 import csv
+import json
 import sys
 from datetime import datetime, timedelta
-from io import StringIO
 from pathlib import Path
-from urllib.parse import urlencode
 
 import requests
 
 
-# Primary endpoint constants (modern API, verified against official manual)
-BOJ_API_URL = "https://www.stat-search.boj.or.jp/api/v1/getDataCode"
-API_DB = "FM01"
-API_SERIES = "STRDCLUCON"
-
-# Fallback endpoint constants (legacy CGI)
-BOJ_CGI_URL = "https://www.stat-search.boj.or.jp/ssi/cgi-bin/famecgi2"
-CGI_SERIES = "IR01'MUTCALAL"
-
-# Common configuration
-OUTPUT_PATH = Path(__file__).resolve().parent.parent / "data" / "TONA.csv"
+# Constants
+BOJ_URL = "https://www.stat-search.boj.or.jp/api/v1/getDataCode"
+DB_CODE = "FM01"
+SERIES_CODE = "STRDCLUCON"
 HISTORY_YEARS = 5
-TIMEOUT_SECONDS = 30
+TIMEOUT_SECONDS = 45
 USER_AGENT = "xccy-g8/1.0 (https://github.com/sanderdayan1982/xccy-g8)"
 
+OUTPUT_FILENAME = "TONA.csv"
+OUTPUT_DIR = Path(__file__).resolve().parent.parent / "data"
 
-# =============================================================================
-# PRIMARY: Modern REST API (BoJ official, launched February 2026)
-# =============================================================================
 
-def fetch_tona_via_modern_api(date_from: datetime) -> list[tuple[str, float]]:
+def _fetch_month_range(
+    start_yyyymm: str,
+    end_yyyymm: str,
+) -> list[tuple[str, float]]:
     """
-    Fetch TONA daily data from the modern BoJ REST API.
+    Fetch TONA data for the given monthly range.
 
-    Reference: https://www.stat-search.boj.or.jp/info/api_manual_en.pdf
-    Series:    FM01/STRDCLUCON (Uncollateralized Overnight Call Rate, average)
-
-    Returns list of (date_str_YYYYMMDD, rate_value) tuples sorted ascending.
+    Returns list of (YYYYMMDD_str, value_percent) tuples, only for days that
+    have non-null values. Sorted ascending by date.
     """
     params = {
         "format": "json",
         "lang": "en",
-        "db": API_DB,
-        "code": API_SERIES,
-        "startDate": date_from.strftime("%Y%m"),
+        "db": DB_CODE,
+        "code": SERIES_CODE,
+        "startDate": start_yyyymm,
+        "endDate": end_yyyymm,
     }
-    url = f"{BOJ_API_URL}?{urlencode(params)}"
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
 
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip",
-    }
-
-    response = requests.get(url, headers=headers, timeout=TIMEOUT_SECONDS)
+    response = requests.get(BOJ_URL, params=params, headers=headers, timeout=TIMEOUT_SECONDS)
     response.raise_for_status()
 
-    data = response.json()
+    try:
+        data = response.json()
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"BoJ API returned non-JSON response: {exc}")
 
+    # API status check (note: STATUS is an integer, not a string)
     status = data.get("STATUS")
-    if status != "200" and status != 200:
-        message = data.get("MESSAGE", "unknown error")
-        raise ValueError(f"BoJ API returned non-200 STATUS: {status} ({message})")
+    if status != 200:
+        message = data.get("MESSAGE", "(no message)")
+        msgid = data.get("MESSAGEID", "(no id)")
+        raise ValueError(f"BoJ API error: STATUS={status}, MESSAGE={message}, ID={msgid}")
 
-    output_section = None
-    for key in ("DATAS", "DATAS_INFO", "API_OUTPUT", "series", "data"):
-        if key in data and isinstance(data[key], list):
-            output_section = data[key]
+    # Extract the series from RESULTSET (not DATA_INF.SERIES as some docs suggest)
+    resultset = data.get("RESULTSET")
+    if not resultset or not isinstance(resultset, list):
+        raise ValueError(f"BoJ API: missing or empty RESULTSET (got {type(resultset).__name__})")
+
+    # Find the matching series (defensive: always look up by SERIES_CODE)
+    series = None
+    for s in resultset:
+        if s.get("SERIES_CODE") == SERIES_CODE:
+            series = s
             break
 
-    if output_section is None:
-        for value in data.values():
-            if isinstance(value, list) and value:
-                first = value[0]
-                if isinstance(first, dict) and "VALUES" in first:
-                    output_section = value
-                    break
-
-    if not output_section:
-        raise ValueError("BoJ API response: no series output section found")
-
-    target_series = None
-    for series in output_section:
-        if not isinstance(series, dict):
-            continue
-        code = series.get("SERIES_CODE", "")
-        if code == API_SERIES or API_SERIES in code:
-            target_series = series
-            break
-
-    if target_series is None:
-        target_series = output_section[0] if isinstance(output_section[0], dict) else None
-
-    if target_series is None:
-        raise ValueError(f"BoJ API response: series {API_SERIES} not found")
-
-    dates = target_series.get("SURVEY_DATES", [])
-    values = target_series.get("VALUES", [])
-
-    if not dates or not values or len(dates) != len(values):
+    if series is None:
+        codes_found = [s.get("SERIES_CODE") for s in resultset]
         raise ValueError(
-            f"BoJ API response: malformed dates/values arrays "
-            f"(dates={len(dates) if dates else 0}, values={len(values) if values else 0})"
+            f"BoJ API: expected SERIES_CODE={SERIES_CODE!r}, got {codes_found}"
+        )
+
+    # Values are nested: RESULTSET[i].VALUES.SURVEY_DATES and .VALUES
+    values_obj = series.get("VALUES")
+    if not isinstance(values_obj, dict):
+        raise ValueError(
+            f"BoJ API: expected SERIES.VALUES to be dict, got {type(values_obj).__name__}"
+        )
+
+    survey_dates = values_obj.get("SURVEY_DATES", [])
+    values_arr = values_obj.get("VALUES", [])
+
+    if not survey_dates or not values_arr:
+        raise ValueError(
+            f"BoJ API: empty SURVEY_DATES ({len(survey_dates)}) or "
+            f"VALUES ({len(values_arr)}) arrays"
+        )
+
+    if len(survey_dates) != len(values_arr):
+        raise ValueError(
+            f"BoJ API: array length mismatch: "
+            f"SURVEY_DATES={len(survey_dates)} vs VALUES={len(values_arr)}"
         )
 
     rows: list[tuple[str, float]] = []
-    for date_raw, value_raw in zip(dates, values):
-        if value_raw is None or value_raw == "":
+    for raw_date, raw_value in zip(survey_dates, values_arr):
+        # Skip null values (weekends, holidays)
+        if raw_value is None:
             continue
 
-        try:
-            date_str = str(date_raw).strip()
-            if len(date_str) == 8:
-                date_obj = datetime.strptime(date_str, "%Y%m%d")
-            elif len(date_str) == 10:
-                date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-            else:
-                continue
-            value = float(value_raw)
-        except (ValueError, TypeError):
+        # Date comes as integer YYYYMMDD (e.g. 20260401)
+        date_str = str(raw_date)
+        if len(date_str) != 8:
             continue
 
-        rows.append((date_obj.strftime("%Y%m%d"), value))
-
-    rows.sort(key=lambda r: r[0])
-    return rows
-
-
-# =============================================================================
-# FALLBACK: Legacy CGI endpoint (defensive parsing)
-# =============================================================================
-
-def _try_parse_boj_date(s: str) -> datetime | None:
-    """BoJ uses multiple date formats. Try common ones in order."""
-    s = s.strip().strip('"')
-    for fmt in ("%Y/%m/%d", "%Y-%m-%d", "%Y%m%d"):
+        # Validate it's a real date (defensive)
         try:
-            return datetime.strptime(s, fmt)
+            datetime.strptime(date_str, "%Y%m%d")
         except ValueError:
             continue
-    return None
 
-
-def _try_parse_value(s: str) -> float | None:
-    """Defensive value parser: handles commas, dashes, NA markers."""
-    s = s.strip().strip('"').replace(",", "")
-    if not s or s in ("-", "N/A", "NA", "..."):
-        return None
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-
-def _find_date_value_columns(all_rows: list[list[str]]) -> tuple[int, int, int]:
-    """Auto-detect data start row and (date_col, value_col) indices."""
-    for i, row in enumerate(all_rows[:15]):
-        if not row:
-            continue
-        for date_col in range(min(3, len(row))):
-            parsed_date = _try_parse_boj_date(row[date_col])
-            if parsed_date is None:
-                continue
-            for value_col in range(date_col + 1, len(row)):
-                parsed_value = _try_parse_value(row[value_col])
-                if parsed_value is not None:
-                    return i, date_col, value_col
-
-    raise ValueError(
-        "BoJ CGI response: no row with parseable (date, value) pair "
-        "found in first 15 rows"
-    )
-
-
-def fetch_tona_via_legacy_cgi(date_from: datetime, date_to: datetime) -> list[tuple[str, float]]:
-    """
-    Fallback fetch: legacy BoJ CGI endpoint.
-
-    Used only if the modern REST API fails for any reason.
-    """
-    params = {
-        "cgi": "$nme_a000_en",
-        "rep_date": "1",
-        "hdnSeriesCodeList": CGI_SERIES,
-        "hdnRSMode": "EXP",
-        "hdnYyyyFrom": str(date_from.year),
-        "hdnMmFrom": f"{date_from.month:02d}",
-        "hdnDdFrom": f"{date_from.day:02d}",
-        "hdnYyyyTo": str(date_to.year),
-        "hdnMmTo": f"{date_to.month:02d}",
-        "hdnDdTo": f"{date_to.day:02d}",
-        "hdnCsvDownload": "1",
-        "hdnExpType": "csv",
-    }
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/csv, application/octet-stream",
-    }
-
-    response = requests.get(BOJ_CGI_URL, params=params, headers=headers, timeout=TIMEOUT_SECONDS)
-    response.raise_for_status()
-
-    if response.encoding is None or response.encoding.lower() == "iso-8859-1":
-        response.encoding = "shift_jis"
-
-    text = response.text.lstrip("\ufeff")
-    if not text:
-        raise ValueError("BoJ CGI response empty")
-
-    all_rows = list(csv.reader(StringIO(text)))
-    if not all_rows:
-        raise ValueError("BoJ CGI response has no parseable rows")
-
-    data_start_idx, date_col, value_col = _find_date_value_columns(all_rows)
-
-    rows: list[tuple[str, float]] = []
-    for raw_row in all_rows[data_start_idx:]:
-        if len(raw_row) <= max(date_col, value_col):
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
             continue
 
-        date_obj = _try_parse_boj_date(raw_row[date_col])
-        if date_obj is None:
-            continue
-
-        if date_obj < date_from or date_obj > date_to:
-            continue
-
-        value = _try_parse_value(raw_row[value_col])
-        if value is None:
-            continue
-
-        rows.append((date_obj.strftime("%Y%m%d"), value))
+        rows.append((date_str, value))
 
     rows.sort(key=lambda r: r[0])
     return rows
 
 
-# =============================================================================
-# OUTPUT
-# =============================================================================
+def fetch_tona(
+    date_from: datetime,
+    date_to: datetime,
+) -> list[tuple[str, float]]:
+    """
+    Fetch TONA data spanning [date_from, date_to].
+
+    BoJ API takes monthly range (YYYYMM), so we request the entire range
+    in a single call. The API handles spans of up to ~6 years cleanly.
+    """
+    start_yyyymm = date_from.strftime("%Y%m")
+    end_yyyymm = date_to.strftime("%Y%m")
+
+    return _fetch_month_range(start_yyyymm, end_yyyymm)
+
 
 def write_csv(rows: list[tuple[str, float]], output_path: Path) -> None:
     """Write rows to OHLCV format CSV (O=H=L=C for daily rates, V=0)."""
@@ -281,53 +206,40 @@ def write_csv(rows: list[tuple[str, float]], output_path: Path) -> None:
             writer.writerow([date_str, v, v, v, v, "0"])
 
 
-# =============================================================================
-# MAIN: Orchestrate primary → fallback strategy
-# =============================================================================
-
 def main() -> int:
     today = datetime.utcnow()
     date_from = today - timedelta(days=365 * HISTORY_YEARS)
 
     print(f"Fetching TONA from {date_from.date()} to {today.date()}")
+    print(f"Source: BoJ Time-Series Data Search REST API v1")
+    print(f"Database: {DB_CODE}, Series: {SERIES_CODE}")
+    print(
+        f"Monthly range: {date_from.strftime('%Y%m')} to {today.strftime('%Y%m')}"
+    )
+    print()
 
-    rows: list[tuple[str, float]] = []
-    source_used = ""
-
-    # --- Primary: modern REST API ---
-    print(f"[Primary] BoJ REST API v1, db={API_DB}, code={API_SERIES}")
     try:
-        rows = fetch_tona_via_modern_api(date_from)
-        source_used = "modern_api"
+        rows = fetch_tona(date_from, today)
     except requests.HTTPError as exc:
-        print(f"[Primary] HTTP error: {exc} — falling back to CGI", file=sys.stderr)
+        print(f"ERROR: BoJ HTTP error: {exc}", file=sys.stderr)
+        return 1
     except requests.RequestException as exc:
-        print(f"[Primary] Network error: {exc} — falling back to CGI", file=sys.stderr)
+        print(f"ERROR: BoJ network error: {exc}", file=sys.stderr)
+        return 1
     except Exception as exc:
-        print(f"[Primary] Parse error: {exc} — falling back to CGI", file=sys.stderr)
-
-    # --- Fallback: legacy CGI ---
-    if not rows:
-        print(f"[Fallback] BoJ legacy CGI, series={CGI_SERIES}")
-        try:
-            rows = fetch_tona_via_legacy_cgi(date_from, today)
-            source_used = "legacy_cgi"
-        except requests.HTTPError as exc:
-            print(f"[Fallback] HTTP error: {exc}", file=sys.stderr)
-        except requests.RequestException as exc:
-            print(f"[Fallback] Network error: {exc}", file=sys.stderr)
-        except Exception as exc:
-            print(f"[Fallback] Parse error: {exc}", file=sys.stderr)
-
-    if not rows:
-        print("ERROR: TONA fetch failed via both primary and fallback sources", file=sys.stderr)
+        print(f"ERROR: TONA fetch failed: {exc}", file=sys.stderr)
         return 1
 
-    write_csv(rows, OUTPUT_PATH)
-    print(f"OK: Wrote {len(rows)} rows to {OUTPUT_PATH}")
-    print(f"     Source used: {source_used}")
-    print(f"     Latest: {rows[-1][0]} = {rows[-1][1]:.4f}%")
-    print(f"     Earliest: {rows[0][0]} = {rows[0][1]:.4f}%")
+    if not rows:
+        print("ERROR: No rows returned", file=sys.stderr)
+        return 1
+
+    output_path = OUTPUT_DIR / OUTPUT_FILENAME
+    write_csv(rows, output_path)
+    print(f"OK: Wrote {len(rows)} rows to {OUTPUT_FILENAME}")
+    print(f"    Latest:   {rows[-1][0]} = {rows[-1][1]:.4f}%")
+    print(f"    Earliest: {rows[0][0]} = {rows[0][1]:.4f}%")
+
     return 0
 
 
